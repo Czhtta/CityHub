@@ -143,8 +143,9 @@ src/main/java/com/hmdp/
 
 ```lua
 -- seckill.lua：原子执行，天然避免并发竞态
-local stock  = redis.call('get', stockKey)               -- 库存判断
-if (stock <= 0) then return 1 end
+local stock  = tonumber(redis.call('get', stockKey))     -- 库存判断
+if (stock == nil) then return -1 end                     -- Key 不存在：券未预热或已清理
+if (stock <= 0) then return 1 end                        -- 售罄
 if (redis.call('sismember', orderKey, userId) == 1) then -- 一人一单
     return 2
 end
@@ -160,7 +161,7 @@ redis.call('sadd', orderKey, userId)                     -- 记录用户
 
 - **幂等**：订单 ID 为主键，重复消费写入失败天然跳过。
 - **丢失兜底**：核心约束（不超卖 + 一人一单）由 Redis + Lua 保证，不受 MQ 丢失影响；DB 副本漂移由 **对账任务** 定期修正（见 §6）。
-- **落库不延迟（关键取舍）**：落库消息 `delayLevel=0` 立即投递，订单尽快落库可见——否则用户秒付时 DB 尚无订单，支付回调会查不到订单。真正需要"延迟"的只有超时关单（见 §5，`delayLevel=14`）。原 RabbitMQ 版的 10s 延时落库为历史遗留，RocketMQ 版已去掉。
+- **落库不延迟（关键取舍）**：落库消息 `delayLevel=0` 立即投递，订单尽快落库可见——否则用户秒付时 DB 尚无订单，支付回调会查不到订单。真正需要"延迟"的只有超时关单（见 §5，`delayLevel=5`）。原 RabbitMQ 版的 10s 延时落库为历史遗留，RocketMQ 版已去掉。
 
 ### 3. 缓存：穿透 / 击穿 / 雪崩
 
@@ -185,8 +186,8 @@ public Result seckillVoucher(@PathVariable("id") Long voucherId) { ... }
 
 **双保险机制**：
 
-1. **RocketMQ 延迟消息精准触发（主）**：秒杀下单时发送一条 `delayLevel=14`（≈10 分钟）的延迟消息到 `seckill-order-close-topic`，到期由 `OrderTimeoutListener` 消费并检查关单——在超时时刻精准触发，避免定时轮询的轮询间隔误差。
-2. **Spring Task 定时扫描（兜底）**：`OrderTimeoutTask` 每 1 分钟扫描超时（10 分钟）未支付订单，兜底延迟消息丢失 / 消费失败的场景。
+1. **RocketMQ 延迟消息精准触发（主）**：秒杀下单时发送一条 `delayLevel=5`（≈1 分钟）的延迟消息到 `seckill-order-close-topic`，到期由 `OrderTimeoutListener` 消费并检查关单——在超时时刻精准触发，避免定时轮询的轮询间隔误差。
+2. **Spring Task 定时扫描（兜底）**：`OrderTimeoutTask` 每 30 秒扫描超时（1 分钟）未支付订单，兜底延迟消息丢失 / 消费失败的场景；扫描前先做 Redis 积压预检（无在途订单集合则跳过），把扫库从"时间驱动"降为"积压驱动"。
 
 两路统一走 `IVoucherOrderService#closeTimeoutOrder`（**乐观锁 + 幂等**）三步释放库存：
 
