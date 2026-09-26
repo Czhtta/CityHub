@@ -31,6 +31,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders;
 import org.springframework.test.web.servlet.result.MockMvcResultMatchers;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.web.client.RestClientResponseException;
 
 import jakarta.annotation.Resource;
 import java.time.LocalDateTime;
@@ -39,6 +40,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -224,7 +226,13 @@ class SeckillConcurrencyTest {
                 if (codeResult.getSuccess() == null || !codeResult.getSuccess()) {
                     return;
                 }
-                String code = codeResult.getData().toString();
+                // 生产接口只返回发送成功，不应把验证码直接暴露给客户端。
+                // 测试环境从 Redis 读取刚写入的验证码，用于批量换取测试 Token。
+                String code = stringRedisTemplate.opsForValue()
+                        .get(RedisConstants.LOGIN_CODE_KEY + phone);
+                if (code == null) {
+                    return;
+                }
 
                 // 2.登录取 token
                 LoginFormDTO form = LoginFormDTO.builder().code(code).phone(phone).build();
@@ -267,6 +275,8 @@ class SeckillConcurrencyTest {
         CountDownLatch startGate = new CountDownLatch(1);
         CountDownLatch finishLatch = new CountDownLatch(tokens.size());
         AtomicInteger httpErrors = new AtomicInteger();
+        ConcurrentHashMap<String, AtomicInteger> errorTypes = new ConcurrentHashMap<>();
+        long startNanos = System.nanoTime();
 
         for (int i = 0; i < tokens.size(); i++) {
             final String token = tokens.get(i);
@@ -284,6 +294,10 @@ class SeckillConcurrencyTest {
                     bodies.add(body == null ? "" : body);
                 } catch (Exception e) {
                     httpErrors.incrementAndGet();
+                    String errorType = e instanceof RestClientResponseException responseException
+                            ? "HTTP " + responseException.getStatusCode().value()
+                            : e.getClass().getSimpleName();
+                    errorTypes.computeIfAbsent(errorType, ignored -> new AtomicInteger()).incrementAndGet();
                     bodies.add("{\"success\":false,\"errorMsg\":\"http error\"}");
                 } finally {
                     finishLatch.countDown();
@@ -294,12 +308,16 @@ class SeckillConcurrencyTest {
         // 同时放行
         startGate.countDown();
         boolean done = finishLatch.await(3, TimeUnit.MINUTES);
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
         executor.shutdown();
 
         Assert.isTrue(done, "并发请求未在超时时间内全部返回");
         if (httpErrors.get() > 0) {
-            log.warn("有 {} 个请求发生传输层异常（计入失败响应）", httpErrors.get());
+            log.warn("有 {} 个请求发生传输层异常（计入失败响应），分类: {}", httpErrors.get(), errorTypes);
         }
+        log.info("HTTP 并发阶段：请求 {}，耗时 {} ms，吞吐约 {} req/s",
+                tokens.size(), elapsedMillis,
+                elapsedMillis == 0 ? 0 : Math.round(tokens.size() * 1000.0 / elapsedMillis));
         Assert.isTrue(bodies.size() == tokens.size(),
                 String.format("响应数 %d 与请求数 %d 不一致", bodies.size(), tokens.size()));
         return bodies;
