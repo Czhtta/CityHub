@@ -14,6 +14,8 @@ import org.apache.rocketmq.spring.core.RocketMQTemplate;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Bean;
@@ -90,6 +92,16 @@ class VoucherOrderPersistenceTest {
         assertEquals(2, stock());
     }
 
+    @ParameterizedTest
+    @ValueSource(ints = {1, 2, 3, 5, 6})
+    void nonCanceledOrderKeepsPurchaseEligibilityOccupied(int status) {
+        orders.createVoucherOrder(100L, 1L, 10L);
+        jdbc.update("UPDATE tb_voucher_order SET status = ? WHERE id = 100", status);
+        assertThrows(DuplicateKeyException.class, () -> listener.onMessage(message(101, 1)));
+        assertEquals(1, countOrders());
+        assertEquals(1, stock());
+    }
+
     @Test
     void canceledOrderAllowsAnotherPurchaseButOldMessageCannotReopenIt() {
         orders.createVoucherOrder(100L, 1L, 10L);
@@ -125,6 +137,40 @@ class VoucherOrderPersistenceTest {
         assertEquals(1, results.stream().filter(Boolean::booleanValue).count());
         assertEquals(1, countOrders());
         assertEquals(0, stock());
+    }
+
+    @Test
+    void migrationRejectsExistingDuplicatesWithoutChangingHistoricalRows() throws Exception {
+        removeActiveConstraint();
+        jdbc.update("INSERT INTO tb_voucher_order(id, user_id, voucher_id) VALUES (100, 1, 10), (101, 1, 10)");
+        assertThrows(DataAccessException.class, () -> jdbc.execute(migrationAlter()));
+        assertEquals(2, countOrders());
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM information_schema.columns "
+                + "WHERE table_schema = DATABASE() AND table_name = 'tb_voucher_order' "
+                + "AND column_name = 'active_order_marker'", Integer.class));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM information_schema.statistics "
+                + "WHERE table_schema = DATABASE() AND table_name = 'tb_voucher_order' "
+                + "AND index_name = 'uk_voucher_order_active'", Integer.class));
+    }
+
+    @Test
+    void migrationPreservesCanceledHistoryAndEnforcesActiveUniqueness() throws Exception {
+        removeActiveConstraint();
+        jdbc.update("INSERT INTO tb_voucher_order(id, user_id, voucher_id, status) "
+                + "VALUES (100, 1, 10, 4), (101, 1, 10, 4), (102, 1, 10, 1)");
+        jdbc.execute(migrationAlter());
+        assertEquals(3, countOrders());
+        assertThrows(DuplicateKeyException.class, () -> orders.createVoucherOrder(103L, 1L, 10L));
+        assertEquals(2, stock());
+    }
+
+    private void removeActiveConstraint() {
+        jdbc.execute("ALTER TABLE tb_voucher_order DROP INDEX uk_voucher_order_active, DROP COLUMN active_order_marker");
+    }
+
+    private String migrationAlter() throws Exception {
+        String migration = resource("db/migrations/V1__active_order_uniqueness.sql");
+        return migration.substring(migration.indexOf("ALTER TABLE"));
     }
 
     private static String resource(String path) throws Exception {

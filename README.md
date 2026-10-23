@@ -31,7 +31,7 @@
 
 ## 项目简介
 
-本仓库基于 [J53616/CityHub](https://github.com/J53616/CityHub) 的 `a236bda` 逐步改造，保留上游历史与 MIT 许可。当前已修复消费者的数据库事务与同订单消息幂等；事务消息、请求终态和可靠 Redis 释放仍待实现。
+本仓库基于 [J53616/CityHub](https://github.com/J53616/CityHub) 的 `a236bda` 逐步改造，保留上游历史与 MIT 许可。当前已修复消费者的数据库事务、同订单消息幂等，并增加有效订单唯一约束；事务消息、请求终态和可靠 Redis 释放仍待实现。
 
 CityHub 是一个类"大众点评"的本地生活服务平台，提供商家信息查询、优惠券秒杀、推广信息、用户互动（点赞 / 关注 / 签到 / 附近商户）等能力。
 
@@ -104,7 +104,7 @@ CityHub 是一个类"大众点评"的本地生活服务平台，提供商家信�
 
 1. 启动 RocketMQ NameServer + Broker（端口 9876 / 10911）。
 2. 启动 MySQL、Redis。
-3. 执行 `src/main/resources/db/hmdp.sql` 初始化数据库。
+3. 新建空库可执行 `src/main/resources/db/hmdp.sql`。已有数据库只执行 `src/main/resources/db/migrations/V1__active_order_uniqueness.sql`，先检查重复有效订单；不要用含 `DROP TABLE` 的初始化脚本升级旧库。迁移发现重复有效订单会失败，需人工核查，不自动删除历史记录。
 4. 修改 `src/main/resources/application.yaml` 中的数据库 / Redis / RocketMQ 连接信息。
 5. 运行 `com.hmdp.HmDianPingApplication`，访问 `http://localhost:8081`。
 
@@ -164,6 +164,7 @@ redis.call('sadd', orderKey, userId)                     -- 记录用户
 - **落库事务**：订单插入与 `stock > 0` 条件扣库存由同一个 MySQL 事务提交；扣减失败会回滚订单。
 - **幂等**：消费者在事务回滚后处理唯一键冲突，仅已有订单 ID、用户和优惠券均一致时跳过。其他冲突和库存失败继续抛出，留给 MQ 重试；持久化拒绝终态与 Redis 释放尚待下一阶段实现。
 - **旧数据边界**：新事务不会修复历史“已插订单但未扣库存”的数据；升级已有数据库前需要核查这类记录。
+- **有效订单防重**：数据库唯一键约束同一用户、同一券只能有一张未取消订单。状态 `4` 的订单释放资格，允许保留多次取消记录；其他现有状态（含已核销、退款中、已退款）继续占用资格，退款后重买规则尚未实现。
 - **丢失兜底**：核心约束（不超卖 + 一人一单）由 Redis + Lua 保证，不受 MQ 丢失影响；DB 副本漂移由 **对账任务** 定期修正（见 §6）。
 - **落库不延迟（关键取舍）**：落库消息 `delayLevel=0` 立即投递，订单尽快落库可见——否则用户秒付时 DB 尚无订单，支付回调会查不到订单。真正需要"延迟"的只有超时关单（见 §5，`delayLevel=5`）。原 RabbitMQ 版的 10s 延时落库为历史遗留，RocketMQ 版已去掉。
 
