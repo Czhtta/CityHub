@@ -31,7 +31,7 @@
 
 ## 项目简介
 
-本仓库基于 [J53616/CityHub](https://github.com/J53616/CityHub) 的 `a236bda` 逐步改造，保留上游历史与 MIT 许可。当前已修复消费者的数据库事务、同订单消息幂等，并增加有效订单唯一约束；事务消息、请求终态和可靠 Redis 释放仍待实现。
+本仓库基于 [J53616/CityHub](https://github.com/J53616/CityHub) 的 `a236bda` 逐步改造，保留上游历史与 MIT 许可。当前已修复消费者的数据库事务、同订单消息幂等，并增加有效订单唯一约束；对账已改为只读差异观察。事务消息、请求终态和可靠 Redis 释放仍待实现。
 
 CityHub 是一个类"大众点评"的本地生活服务平台，提供商家信息查询、优惠券秒杀、推广信息、用户互动（点赞 / 关注 / 签到 / 附近商户）等能力。
 
@@ -80,7 +80,7 @@ CityHub 是一个类"大众点评"的本地生活服务平台，提供商家信�
 | 缓存穿透 | 缓存空值 + 短 TTL | `CacheClient#queryWithPassThrough` |
 | 接口限流 | 滑动窗口（注解 + AOP + Lua），支持全局 / IP / 用户维度 | `RateLimitAspect`、`rateLimit.lua` |
 | 超时关单 | RocketMQ 延迟消息精准触发 + Spring Task 定时扫描兜底，乐观锁释放库存 | `OrderTimeoutListener`、`OrderTimeoutTask` |
-| 数据一致性对账 | 定时比对 Redis 与 DB，以 Redis 为准修正 | `StockReconcileTask` |
+| 数据一致性对账 | 定时只读比对 Redis 与 DB，差异需结合在途处理复核 | `StockReconcileTask` |
 | 缓存删除补偿 | 删缓存失败发 RocketMQ 重试 + 物理 TTL 兜底 | `ShopServiceImpl#update`、`CacheDeleteListener` |
 | 支付回调 | 乐观锁状态流转，与超时关单并发互斥 | `VoucherOrderServiceImpl#payCallback` |
 | 全局唯一 ID | 时间戳 + 自增序列号（64 位） | `RedisIdWorker` |
@@ -165,7 +165,7 @@ redis.call('sadd', orderKey, userId)                     -- 记录用户
 - **幂等**：消费者在事务回滚后处理唯一键冲突，仅已有订单 ID、用户和优惠券均一致时跳过。其他冲突和库存失败继续抛出，留给 MQ 重试；持久化拒绝终态与 Redis 释放尚待下一阶段实现。
 - **旧数据边界**：新事务不会修复历史“已插订单但未扣库存”的数据；升级已有数据库前需要核查这类记录。
 - **有效订单防重**：数据库唯一键约束同一用户、同一券只能有一张未取消订单。状态 `4` 的订单释放资格，允许保留多次取消记录；其他现有状态（含已核销、退款中、已退款）继续占用资格，退款后重买规则尚未实现。
-- **丢失兜底**：核心约束（不超卖 + 一人一单）由 Redis + Lua 保证，不受 MQ 丢失影响；DB 副本漂移由 **对账任务** 定期修正（见 §6）。
+- **恢复边界**：发送超时仍可能触发错误的 Redis 回补；对账仅观察差异，尚不能恢复丢失的请求。事务消息、持久化终态和可靠释放将在后续阶段实现。
 - **落库不延迟（关键取舍）**：落库消息 `delayLevel=0` 立即投递，订单尽快落库可见——否则用户秒付时 DB 尚无订单，支付回调会查不到订单。真正需要"延迟"的只有超时关单（见 §5，`delayLevel=5`）。原 RabbitMQ 版的 10s 延时落库为历史遗留，RocketMQ 版已去掉。
 
 ### 3. 缓存：穿透 / 击穿 / 雪崩
@@ -207,8 +207,8 @@ public Result seckillVoucher(@PathVariable("id") Long voucherId) { ... }
 `StockReconcileTask` 每 10 分钟比对所有秒杀券的 Redis 与 DB：
 
 - **比对项**：Redis 库存 / Redis 下单集合大小 vs DB 库存 / DB 有效订单数（未取消）。
-- **修正**：以 Redis 为准回写 DB 库存（Redis 是不超卖的唯一权威）。
-- **告警**：Redis 下单数 > DB 有效订单数 → 疑似 MQ 消息丢失，输出 ERROR 日志人工复核。
+- **只读观察**：不覆盖任一侧库存。Redis 已预占、消费者尚未落库时的正常差异不能当作修正依据。
+- **差异日志**：快照不一致可能来自在途操作或异常，需结合订单和消息处理状态复核；不会自动补单。
 
 ### 7. 缓存删除失败补偿（Cache Aside 一致性）
 
@@ -246,7 +246,7 @@ public Result seckillVoucher(@PathVariable("id") Long voucherId) { ... }
 本轮回归使用 JDK 17。无需中间件的单元测试：
 
 ```sh
-mvn -s maven-settings.xml -Dtest=SeckillVoucherListenerTest,VoucherOrderCreationTest test
+mvn -s maven-settings.xml -Dtest=SeckillVoucherListenerTest,VoucherOrderCreationTest,StockReconcileTaskTest test
 ```
 
 `VoucherOrderPersistenceTest` 使用真实 Spring 事务代理和 MySQL，覆盖重复投递、故障回滚及并发扣减。设置 `CITYHUB_TEST_DB_URL` 与 `CITYHUB_TEST_DB_PASSWORD` 后显式运行；URL 仅接受本机端口上的 `cityhub_test_*` 数据库，测试会重建其中的订单和秒杀券表。未设置环境变量时该测试跳过，不连接应用配置中的数据库。
@@ -272,7 +272,7 @@ mvn -s maven-settings.xml -Dtest=VoucherOrderPersistenceTest test
 | 缓存空值（防穿透） | ✅ 已实现（`CacheClient#queryWithPassThrough`） |
 | 滑动窗口限流（注解 + 切面 + Lua） | ✅ 已实现（`RateLimitAspect` + `rateLimit.lua`） |
 | 超时订单定时关单（Spring Task） | ✅ 已实现（`OrderTimeoutTask`） |
-| 秒杀数据对账（Redis 权威修正） | ✅ 已实现（`StockReconcileTask`） |
+| 秒杀数据对账（只读差异观察） | ✅ 已实现（`StockReconcileTask`，不自动修正或补单） |
 | 缓存删除失败 MQ 补偿 + 物理 TTL 兜底 | ✅ 已实现（`ShopServiceImpl#update` + `CacheDeleteListener`） |
 | 支付回调乐观锁（状态流转 / 退款） | ✅ 已实现（`VoucherOrderServiceImpl#payCallback`） |
 | 分布式锁（SETNX → Redisson） | 📦 已演进为 Lua 原子方案（锁类已删，`RedissonConfig` 保留待用；当前无调用点） |
@@ -287,9 +287,10 @@ mvn -s maven-settings.xml -Dtest=VoucherOrderPersistenceTest test
 
 ## 后续计划
 
-以下方案针对 **更大规模部署场景**（多实例、更高并发、更强风控），当前单体架构下暂未落地，README 记录设计取舍，可随时按需实现：
+后续阶段将处理发送结果不确定、进程崩溃和跨存储释放。这些故障在单实例下也可能出现，当前尚未形成完整恢复链路：
 
-- **RocketMQ 事务消息 + 本地消息表**：将"下单"与"发消息"强一致，替代当前"发消息失败即回滚 Redis 预扣 + 对账兜底"的补偿方案。
+- **RocketMQ 事务消息与请求终态**：关联预占结果与创建消息，保留原订单 ID 和可恢复处理结果。事务回查不等于消费者事务，也不能消除 Redis 持久化的数据丢失边界。
+- **可靠 Redis 释放**：数据库关单或拒绝时同事务记录释放待办，后台按订单 ID 幂等执行，避免旧订单释放误伤新预占。
 - **支付渠道对接**：支付回调目前为模拟接口，未接真实支付宝 / 微信的验签、退款等能力。
 - **秒杀活动时间校验**：`tb_seckill_voucher` 已有 `begin_time` / `end_time`，但下单链路的 `seckill.lua` 只判断库存与一人一单，未校验活动是否开始 / 结束。生产需在 Lua 中增加时间判断，或由定时任务在开始时报时预热、结束时清理 Key。
 - **Redis 持久化策略**：项目仅提供 `spring.data.redis` 连接配置，未声明 RDB / AOF 策略。Redis 整体宕机且无持久化时 `seckill:stock` 会丢失，恢复后 Lua 因取不到库存 Key 返回 `-1`（表现为"秒杀已结束"）。生产需显式开启 AOF（`appendonly yes`）并配置主从。

@@ -137,9 +137,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     org.springframework.messaging.support.MessageBuilder.withPayload(jsonStr).build(),
                     3000, 0);
         } catch (Exception e) {
-            // 落库消息发送失败 ⇒ 订单永远不会落库，必须同步回滚 Redis 预扣。
-            // 否则该名额被永久占用：DB 无订单 → OrderTimeoutTask / 延迟关单消息都扫不到、无法释放；
-            // 且 StockReconcileTask 以 Redis 为准会把 DB 库存一并改低，名额彻底丢失（少卖）。
+            // shortcut: 发送超时可能已到达 Broker，事务消息阶段需替换此处直接回补。
             log.error("发送 RocketMQ 落库消息失败，回滚 Redis 预扣，订单ID: {}", orderId, e);
             rollbackPreDeduct(userId, voucherId);
             throw new RuntimeException("下单失败，请重试");
