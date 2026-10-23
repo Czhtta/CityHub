@@ -31,6 +31,8 @@
 
 ## 项目简介
 
+本仓库基于 [J53616/CityHub](https://github.com/J53616/CityHub) 的 `a236bda` 逐步改造，保留上游历史与 MIT 许可。当前已修复消费者的数据库事务与同订单消息幂等；事务消息、请求终态和可靠 Redis 释放仍待实现。
+
 CityHub 是一个类"大众点评"的本地生活服务平台，提供商家信息查询、优惠券秒杀、推广信息、用户互动（点赞 / 关注 / 签到 / 附近商户）等能力。
 
 项目的重点不在于业务功能本身，而在于 **高并发秒杀场景下，如何把单体系统从"能用"优化到"抗压"**。围绕秒杀链路的性能瓶颈，基于 **缓存架构 + 消息队列** 进行了深度优化，解决了超卖、缓存穿透 / 击穿、数据一致性等核心问题。
@@ -159,7 +161,9 @@ redis.call('sadd', orderKey, userId)                     -- 记录用户
 
 ### 2. 消息可靠性：幂等、丢失、最终一致
 
-- **幂等**：订单 ID 为主键，重复消费写入失败天然跳过。
+- **落库事务**：订单插入与 `stock > 0` 条件扣库存由同一个 MySQL 事务提交；扣减失败会回滚订单。
+- **幂等**：消费者在事务回滚后处理唯一键冲突，仅已有订单 ID、用户和优惠券均一致时跳过。其他冲突和库存失败继续抛出，留给 MQ 重试；持久化拒绝终态与 Redis 释放尚待下一阶段实现。
+- **旧数据边界**：新事务不会修复历史“已插订单但未扣库存”的数据；升级已有数据库前需要核查这类记录。
 - **丢失兜底**：核心约束（不超卖 + 一人一单）由 Redis + Lua 保证，不受 MQ 丢失影响；DB 副本漂移由 **对账任务** 定期修正（见 §6）。
 - **落库不延迟（关键取舍）**：落库消息 `delayLevel=0` 立即投递，订单尽快落库可见——否则用户秒付时 DB 尚无订单，支付回调会查不到订单。真正需要"延迟"的只有超时关单（见 §5，`delayLevel=5`）。原 RabbitMQ 版的 10s 延时落库为历史遗留，RocketMQ 版已去掉。
 
@@ -237,6 +241,20 @@ public Result seckillVoucher(@PathVariable("id") Long voucherId) { ... }
 - **限流防护**：刷券、爬虫等异常流量在入口被滑动窗口拦截，防止系统过载。
 
 > 说明：仓库不内置压测脚本与性能数据。若要量化"优化效果"，建议配合 JMeter 对本机秒杀接口做并发压测，对比 MySQL 直连与 Redis+Lua 两版的吞吐 / RT 数据。
+
+本轮回归使用 JDK 17。无需中间件的单元测试：
+
+```sh
+mvn -s maven-settings.xml -Dtest=SeckillVoucherListenerTest,VoucherOrderCreationTest test
+```
+
+`VoucherOrderPersistenceTest` 使用真实 Spring 事务代理和 MySQL，覆盖重复投递、故障回滚及并发扣减。设置 `CITYHUB_TEST_DB_URL` 与 `CITYHUB_TEST_DB_PASSWORD` 后显式运行；URL 仅接受本机端口上的 `cityhub_test_*` 数据库，测试会重建其中的订单和秒杀券表。未设置环境变量时该测试跳过，不连接应用配置中的数据库。
+
+```sh
+CITYHUB_TEST_DB_URL='jdbc:mysql://127.0.0.1:3306/cityhub_test_consistency?useSSL=false&allowPublicKeyRetrieval=true' \
+CITYHUB_TEST_DB_PASSWORD='<测试库 root 密码>' \
+mvn -s maven-settings.xml -Dtest=VoucherOrderPersistenceTest test
+```
 
 ---
 

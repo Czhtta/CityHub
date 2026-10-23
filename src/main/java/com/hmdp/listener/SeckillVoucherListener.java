@@ -1,8 +1,8 @@
 package com.hmdp.listener;
 
+import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 import com.hmdp.entity.VoucherOrder;
-import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -10,6 +10,8 @@ import org.apache.rocketmq.spring.annotation.RocketMQMessageListener;
 import org.apache.rocketmq.spring.core.RocketMQListener;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Component;
+
+import java.util.Objects;
 
 /**
  * 秒杀订单异步消费者
@@ -29,26 +31,25 @@ import org.springframework.stereotype.Component;
 public class SeckillVoucherListener implements RocketMQListener<String> {
 
     private final IVoucherOrderService voucherOrderService;
-    private final ISeckillVoucherService seckillVoucherService;
 
     @Override
     public void onMessage(String msg) {
         log.info("收到秒杀订单消息: {}", msg);
-        VoucherOrder voucherOrder = JSONUtil.toBean(msg, VoucherOrder.class);
-        // 订单 ID 为主键，重复消费会命中主键唯一约束冲突。
-        // 这是"幂等命中"的**正常语义，不是消费失败**：必须捕获并直接返回，否则 RocketMQ 会判定消费失败
-        // 并反复重投（默认 maxReconsumeTimes=16 次后进死信队列）。同时必须 return，避免重复扣减 DB 库存。
+        JSONObject event = JSONUtil.parseObj(msg);
+        Long orderId = event.getLong("id");
+        Long userId = event.getLong("userId");
+        Long voucherId = event.getLong("voucherId");
         try {
-            voucherOrderService.save(voucherOrder);
+            voucherOrderService.createVoucherOrder(orderId, userId, voucherId);
         } catch (DuplicateKeyException e) {
-            log.info("订单已存在，幂等命中，跳过落库与扣减，orderId: {}", voucherOrder.getId());
-            return;
+            // 代理事务已回滚；业务唯一键冲突不能当作当前消息已经处理。
+            VoucherOrder existing = voucherOrderService.getById(orderId);
+            if (existing == null || !Objects.equals(existing.getUserId(), userId)
+                    || !Objects.equals(existing.getVoucherId(), voucherId)) {
+                throw e;
+            }
+            // shortcut: 订单存在依赖新事务的完整提交保证，升级旧库前须核查历史半完成订单。
+            log.info("订单已完整创建，幂等命中，orderId: {}", orderId);
         }
-        // 数据库秒杀库存减一（CAS，stock > 0）
-        seckillVoucherService.update()
-                .setSql("stock = stock - 1")
-                .eq("voucher_id", voucherOrder.getVoucherId())
-                .gt("stock", 0)
-                .update();
     }
 }
