@@ -1,8 +1,10 @@
 package com.hmdp.service.impl;
 
 import cn.hutool.json.JSONUtil;
+import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
 import com.hmdp.dto.PayCallbackDTO;
 import com.hmdp.dto.Result;
+import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.VoucherOrder;
 import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.service.ISeckillVoucherService;
@@ -135,9 +137,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     org.springframework.messaging.support.MessageBuilder.withPayload(jsonStr).build(),
                     3000, 0);
         } catch (Exception e) {
-            // 落库消息发送失败 ⇒ 订单永远不会落库，必须同步回滚 Redis 预扣。
-            // 否则该名额被永久占用：DB 无订单 → OrderTimeoutTask / 延迟关单消息都扫不到、无法释放；
-            // 且 StockReconcileTask 以 Redis 为准会把 DB 库存一并改低，名额彻底丢失（少卖）。
+            // shortcut: 发送超时可能已到达 Broker，事务消息阶段需替换此处直接回补。
             log.error("发送 RocketMQ 落库消息失败，回滚 Redis 预扣，订单ID: {}", orderId, e);
             rollbackPreDeduct(userId, voucherId);
             throw new RuntimeException("下单失败，请重试");
@@ -153,6 +153,30 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
         // 3. 返回订单号给前端（实际下单异步处理）
         return Result.ok(orderId);
+    }
+
+    @Override
+    @Transactional
+    public void createVoucherOrder(Long orderId, Long userId, Long voucherId) {
+        if (orderId == null || orderId <= 0 || userId == null || userId <= 0
+                || voucherId == null || voucherId <= 0) {
+            throw new IllegalArgumentException("订单、用户和优惠券 ID 必须为正数");
+        }
+        VoucherOrder order = new VoucherOrder()
+                .setId(orderId)
+                .setUserId(userId)
+                .setVoucherId(voucherId)
+                .setStatus(STATUS_UNPAID);
+        if (!save(order)) {
+            throw new IllegalStateException("订单保存失败，orderId: " + orderId);
+        }
+        boolean deducted = seckillVoucherService.update(new UpdateWrapper<SeckillVoucher>()
+                .setSql("stock = stock - 1")
+                .eq("voucher_id", voucherId)
+                .gt("stock", 0));
+        if (!deducted) {
+            throw new IllegalStateException("数据库库存不足或优惠券不存在，voucherId: " + voucherId);
+        }
     }
 
 

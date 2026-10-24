@@ -17,6 +17,9 @@ public interface IVoucherOrderService extends IService<VoucherOrder> {
 
     Result seckillVoucher(Long voucherId);
 
+    /** 在一个数据库事务中创建未支付订单并扣减库存。 */
+    void createVoucherOrder(Long orderId, Long userId, Long voucherId);
+
     /**
      * 支付成功回调：乐观锁更新订单状态为已支付
      *
